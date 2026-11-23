@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch annotated tag
+        shell: bash
+        run: git fetch --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "huge-file-reader-$env:GITHUB_REF_NAME-windows-x64"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target\release\huge-file-reader.exe, README.md $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          Copy-Item target\release\huge-file-reader.exe "huge-file-reader-$env:GITHUB_REF_NAME-windows-x64.exe"
+
+      - name: Release notes from tag message
+        shell: bash
+        run: git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          body_path: notes.md
+          files: |
+            huge-file-reader-*-windows-x64.zip
+            huge-file-reader-*-windows-x64.exe
