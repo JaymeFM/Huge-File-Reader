@@ -27,7 +27,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "Huge File Reader",
         options,
-        Box::new(move |cc| Ok(Box::new(app::App::new(cc, file, query)))),
+        Box::new(move |cc| Ok(Box::new(app::App::new(cc, file, query, Some(hfr::link::port()))))),
     )
 }
 

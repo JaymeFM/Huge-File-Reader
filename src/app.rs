@@ -20,6 +20,7 @@ use eframe::egui::{
 use hfr::fileio::{detect_drive_kind, open_read, read_full_at, DriveKind};
 use hfr::fmt;
 use hfr::lines::{self, LineIndex, Snippet, TextLine};
+use hfr::link::{self, Link};
 use hfr::search::{self, Hit, Matcher, SearchEvent, SearchHandle, SearchOptions, SearchSummary};
 
 /// Lines loaded into the viewer per step when scrolling past an edge.
@@ -36,6 +37,8 @@ const COPY_MAX: usize = 16 << 20;
 const CLIPBOARD_MAX: usize = 64 << 20;
 /// The search box grows to this many rows, then scrolls.
 const SEARCH_BOX_ROWS: f32 = 6.0;
+/// The linked app is sent at most this many selected results.
+const LINK_MAX_HITS: usize = 10_000;
 /// Highlight colors for the search texts, in order (dark text on top).
 const TERM_COLORS: [Color32; 6] = [
     Color32::from_rgb(255, 204, 0),
@@ -162,6 +165,17 @@ pub struct App {
     results_scroll_to: Option<usize>,
     results_visible: Range<usize>,
 
+    /// The local link to another app that follows the selection.
+    link: Option<Link>,
+    /// Counts result lists: each search or opened file starts a new one.
+    results_gen: u64,
+    /// What the linked app was last sent: (results list, first and last listed
+    /// result, results selected, current result).
+    link_sent: Option<(u64, usize, usize, usize, Option<usize>)>,
+    link_hits: Arc<Vec<link::Hit>>,
+    /// The search the results come from.
+    searched: link::Search,
+
     viewer: Viewer,
     goto_text: String,
     jump_pct: f32,
@@ -177,7 +191,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>, query: Option<String>) -> Self {
+    /// `link_port`: the local port to link to, if any.
+    pub fn new(
+        cc: &eframe::CreationContext<'_>,
+        file: Option<PathBuf>,
+        query: Option<String>,
+        link_port: Option<u16>,
+    ) -> Self {
         install_fallback_fonts(&cc.egui_ctx);
         let mut app = App {
             file: None,
@@ -199,6 +219,14 @@ impl App {
             snippets: HashMap::new(),
             results_scroll_to: None,
             results_visible: 0..0,
+            link: link_port.map(|port| {
+                let waker = cc.egui_ctx.clone();
+                Link::start(port, move || waker.request_repaint())
+            }),
+            results_gen: 0,
+            link_sent: None,
+            link_hits: Arc::new(Vec::new()),
+            searched: link::Search::default(),
             viewer: Viewer::default(),
             goto_text: String::new(),
             jump_pct: 0.0,
@@ -288,6 +316,7 @@ impl App {
         self.snippets.clear();
         self.results_scroll_to = None;
         self.results_visible = 0..0;
+        self.results_gen += 1;
     }
 
     fn start_search(&mut self, ctx: &egui::Context) {
@@ -314,6 +343,12 @@ impl App {
         let waker = ctx.clone();
         match search::start_search(&path, opts, Some(Arc::new(move || waker.request_repaint()))) {
             Ok(handle) => {
+                self.searched = link::Search {
+                    terms: search_terms(&self.query),
+                    regex: self.use_regex,
+                    match_case: self.match_case,
+                    whole_word: self.whole_word,
+                };
                 self.highlight = Some(regex);
                 self.search = Some(handle);
                 self.status = None;
@@ -329,26 +364,32 @@ impl App {
         // Keep the handle until its Finished event arrives so we get a summary.
     }
 
-    /// Makes result `i` the current one and the only one selected.
-    fn select_hit(&mut self, i: usize) {
+    /// Makes result `i` the current one, shown in the viewer, without
+    /// changing which results are selected.
+    fn show_hit(&mut self, i: usize) {
         let Some(&hit) = self.hits.get(i) else { return };
         self.selected = Some(i);
-        self.sel_anchor = i;
-        self.sel_range = None;
         self.copy_from_viewer = false;
         self.results_scroll_to = Some(i);
         self.view_at(hit.line_start, Some(hit.line_no));
     }
 
+    /// Makes result `i` the current one and the only one selected.
+    fn select_hit(&mut self, i: usize) {
+        if i < self.hits.len() {
+            self.sel_anchor = i;
+            self.sel_range = None;
+            self.show_hit(i);
+        }
+    }
+
     /// Selects everything from the anchor to result `i`, which becomes current.
     fn extend_selection(&mut self, i: usize) {
-        let Some(&hit) = self.hits.get(i) else { return };
-        let anchor = self.sel_anchor.min(self.hits.len() - 1);
-        self.selected = Some(i);
-        self.sel_range = Some((anchor.min(i), anchor.max(i)));
-        self.copy_from_viewer = false;
-        self.results_scroll_to = Some(i);
-        self.view_at(hit.line_start, Some(hit.line_no));
+        if i < self.hits.len() {
+            let anchor = self.sel_anchor.min(self.hits.len() - 1);
+            self.sel_range = Some((anchor.min(i), anchor.max(i)));
+            self.show_hit(i);
+        }
     }
 
     /// Selects every result, including ones a running search adds later.
@@ -916,6 +957,11 @@ impl App {
                 None => {}
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.link.as_ref().is_some_and(Link::is_connected) {
+                    ui.label("🔗 Linked")
+                        .on_hover_text("Another app is connected and is sent the selected lines.");
+                    ui.separator();
+                }
                 ui.weak(
                     "Ctrl+O open  ·  Ctrl+F search  ·  F3 / ↑↓ next match  ·  Ctrl+A select all  ·  Ctrl+C copy  ·  \
                      Ctrl+G go to line  ·  Esc stop",
@@ -1282,6 +1328,50 @@ impl App {
         }
     }
 
+    /// Sends the selection to the linked app when it changes, and shows
+    /// the results it asks for.
+    fn sync_link(&mut self) {
+        let shows: Vec<link::Show> = match &self.link {
+            Some(l) => l.shows.try_iter().collect(),
+            None => return,
+        };
+        for s in shows {
+            // Ignore requests about an older results list.
+            if self.hits.get(s.index).is_some_and(|h| h.line_start == s.line_start) {
+                self.show_hit(s.index);
+            }
+        }
+        let Some(link) = &self.link else { return };
+        let (Some(f), Some((lo, hi))) = (&self.file, self.selection()) else {
+            if self.link_sent.take().is_some() {
+                link.publish(None);
+            }
+            return;
+        };
+        let last = hi.min(lo + LINK_MAX_HITS - 1);
+        let sent = (self.results_gen, lo, last, hi - lo + 1, self.selected);
+        if self.link_sent == Some(sent) {
+            return;
+        }
+        if self.link_sent.is_none_or(|(g, l, e, _, _)| (g, l, e) != (sent.0, lo, last)) {
+            let hits = self.hits[lo..=last].iter().zip(lo..).map(|(h, index)| link::Hit {
+                index,
+                line_no: h.line_no,
+                line_start: h.line_start,
+                match_offset: h.match_offset(),
+            });
+            self.link_hits = Arc::new(hits.collect());
+        }
+        link.publish(Some(Arc::new(link::Selection {
+            path: f.path.clone(),
+            total: (hi - lo + 1) as u64,
+            current: self.selected,
+            search: self.searched.clone(),
+            hits: Arc::clone(&self.link_hits),
+        })));
+        self.link_sent = Some(sent);
+    }
+
     fn drop_overlay(&self, ctx: &egui::Context) {
         if ctx.input(|i| i.raw.hovered_files.is_empty()) {
             return;
@@ -1305,6 +1395,7 @@ impl eframe::App for App {
         self.handle_input(&ctx);
         self.poll_search();
         self.poll_jobs(&ctx);
+        self.sync_link();
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));

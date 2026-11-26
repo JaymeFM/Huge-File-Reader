@@ -1,7 +1,8 @@
 //! Headless UI tests: drive the real app with simulated input through
 //! egui_kittest, without opening a window.
 
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -44,7 +45,7 @@ fn harness(file: &TempFile, query: &str) -> Harness<'static, App> {
     let (path, query) = (file.0.clone(), query.to_string());
     Harness::builder()
         .with_size([1280.0, 860.0])
-        .build_eframe(move |cc| App::new(cc, Some(path), Some(query)))
+        .build_eframe(move |cc| App::new(cc, Some(path), Some(query), None))
 }
 
 /// Steps frames until `done` holds (background threads need real time).
@@ -322,4 +323,68 @@ fn select_all_and_copy_found_lines() {
     h.key_press_modifiers(Modifiers::COMMAND, Key::A);
     h.run_steps(2);
     assert_eq!(h.state().selected_count(), 1);
+}
+
+/// Reads lines from the other app's side of the link until one starting with
+/// `until`; returns them from the last `SEL` on (or just that line).
+fn read_message(reader: &mut BufReader<TcpStream>, until: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    loop {
+        let mut l = String::new();
+        reader.read_line(&mut l).expect("a line from Huge File Reader");
+        let l = l.trim_end().to_string();
+        if l.starts_with("SEL	") {
+            lines.clear();
+        }
+        let done = l.starts_with(until);
+        lines.push(l);
+        if done {
+            return lines;
+        }
+    }
+}
+
+#[test]
+fn sends_the_selection_over_the_link() {
+    let file = TempFile::sample();
+    let other = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = other.local_addr().unwrap().port();
+    let path = file.0.clone();
+    let mut h = Harness::builder()
+        .with_size([1280.0, 860.0])
+        .build_eframe(move |cc| App::new(cc, Some(path), Some("needle".into()), Some(port)));
+    run_until(&mut h, "search to finish", |a| a.search.is_none() && a.summary.is_some());
+    let (stream, _) = other.accept().unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // The first result is selected.
+    let starts: Vec<u64> = h.state().hits.iter().map(|h| h.line_start).collect();
+    let msg = read_message(&mut reader, "END");
+    let path = hfr::link::escape(&file.0.display().to_string());
+    assert_eq!(msg[0], format!("SEL	1	0	{path}"));
+    assert_eq!(msg[1..3], ["FIND	0	0	0", "TERM	needle"]);
+    assert!(msg[3].starts_with(&format!("HIT	0	50000	{}	", starts[0])), "{}", msg[3]);
+    run_until(&mut h, "link", |a| a.link.as_ref().unwrap().is_connected());
+    h.get_by_label("🔗 Linked");
+
+    // Select all: both results are sent.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.run_steps(2);
+    let msg = read_message(&mut reader, "END");
+    assert_eq!(msg[0], format!("SEL	2	0	{path}"));
+    assert_eq!(msg.iter().filter(|l| l.starts_with("HIT	")).count(), 2);
+
+    // The other app asks to show the second; the selection stays.
+    (&stream).write_all(format!("SHOW	1	{}
+", starts[1]).as_bytes()).unwrap();
+    run_until(&mut h, "show", |a| a.selected == Some(1));
+    assert_eq!(h.state().selection(), Some((0, 1)));
+    assert_eq!(marked_line(h.state()).0, 150_000);
+    assert_eq!(read_message(&mut reader, "CUR"), ["CUR	1"]);
+    // A request about an older list of results is ignored.
+    (&stream).write_all(b"SHOW	0	12345
+").unwrap();
+    h.run_steps(5);
+    assert_eq!(h.state().selected, Some(1));
 }

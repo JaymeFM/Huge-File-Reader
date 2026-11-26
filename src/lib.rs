@@ -9,4 +9,5 @@ pub mod export;
 pub mod fileio;
 pub mod fmt;
 pub mod lines;
+pub mod link;
 pub mod search;

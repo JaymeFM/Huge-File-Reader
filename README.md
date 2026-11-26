@@ -28,6 +28,10 @@ Run `target\release\huge-file-reader.exe`.
 5. **Go to line** jumps straight to any line number (**Ctrl+G**). The **position slider** jumps to any point in
    the file, and the ⏮ ⏭ buttons go to the start and end.
 6. **Save matching lines…** writes every matching line to a new text file, optionally with line numbers.
+7. **Link to another app**: an app listening on `127.0.0.1` port 47391 (or `HFR_LINK_PORT`) is sent every
+   selection change (file, search, and the selected lines' positions; up to 10,000 lines) and can ask for a line to be
+   shown here. Huge File Reader connects by itself whenever such an app is running; the status bar shows
+   **🔗 Linked** while it is. The protocol is described at the top of [`src/link.rs`](src/link.rs).
 
 ## How fast is it?
 
@@ -82,6 +86,7 @@ cargo run --release --example bench -- C:\temp\test.log ERROR timeout --all   # 
 | `src/lines.rs` | Reading lines around any offset, match snippets, the sparse line index and *go to line* |
 | `src/fileio.rs` | Positional reads and SSD/hard-drive detection |
 | `src/export.rs` | Saving matching lines to a file, or collecting them for the clipboard |
+| `src/link.rs` | The local link to another app: sends the selection, receives what to show (protocol described in the file) |
 | `src/app.rs` | The user interface (egui) |
 | `tests/search.rs` | Checks the engine against a simple line-by-line reference across many chunk sizes and thread counts |
-| `src/app_tests.rs` | Drives the real UI headlessly: search, several texts, select all and copy, navigation, go to line, scrolling |
+| `src/app_tests.rs` | Drives the real UI headlessly: search, several texts, select all and copy, navigation, go to line, scrolling, the link |
